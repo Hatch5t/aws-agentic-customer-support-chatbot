@@ -1,0 +1,285 @@
+# Bug report tool + AgentCore IAM roles.
+#
+# The inline Lambda code below mirrors create_bug_report.py — if you change
+# one, keep the other in sync.
+#
+# This template creates everything your chatbot needs on the "classic AWS"
+# side:
+#   * a DynamoDB table that stores bug tickets
+#   * the create_bug_report Lambda function (the tool implementation)
+#   * three IAM roles:
+#       1. the Lambda's own execution role (logs + PutItem on the table)
+#       2. the AgentCore *Gateway* role — the gateway assumes this role to
+#          invoke the Lambda on the model's behalf
+#       3. the AgentCore *harness execution* role — the managed harness
+#          assumes this role to call Bedrock models, write logs/metrics,
+#          and invoke the gateway
+#
+# The AgentCore resources themselves (gateway, gateway target, harness) are
+# created afterwards with the setup_gateway.py and create_harness.py scripts,
+# which read this stack's outputs automatically.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Bug report tool - DynamoDB table, Lambda function, and IAM roles for Amazon Bedrock AgentCore
+
+Resources:
+
+  BugReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-bug-reports
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBPutItem
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt BugReportsTable.Arn
+
+  CreateBugReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-bug-report
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BugReportsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+
+          def _tool_name(context):
+              """AgentCore Gateway passes the tool name via the Lambda client
+              context, namespaced as "<targetName>___<toolName>"."""
+              client_context = getattr(context, "client_context", None)
+              custom = getattr(client_context, "custom", None) or {}
+              name = custom.get("bedrockAgentCoreToolName", "")
+              return name.split("___")[-1] if "___" in name else name
+
+
+          def lambda_handler(event, context):
+              # The gateway sends the tool arguments directly as the event.
+              # Keep this print: it shows the exact event shape in CloudWatch
+              # Logs, which is invaluable when debugging your first invoke.
+              print("EVENT:", json.dumps(event, default=str))
+
+              tool_name = _tool_name(context)
+              print("TOOL NAME:", tool_name)
+              if tool_name and tool_name != "create_bug_report":
+                  return {"error": f"unsupported tool: {tool_name}"}
+
+              if not isinstance(event, dict):
+                  return {"error": "unexpected event shape", "event": str(event)}
+
+              description = str(event.get("description") or "").strip()
+              steps = str(event.get("stepsToReproduce") or "").strip()
+              environment = str(event.get("environment") or "").strip()
+
+              # All three fields are required and must be non-empty. The model
+              # sometimes tries to satisfy a "required" parameter with an empty
+              # string — returning an error here tells it to go back and ask the
+              # customer instead of filing an incomplete ticket.
+              missing = [name for name, value in [("description", description),
+                                                  ("stepsToReproduce", steps),
+                                                  ("environment", environment)] if not value]
+              if missing:
+                  return {"error": "missing required field(s): " + ", ".join(missing)
+                                   + ". Ask the customer for them before filing the ticket."}
+
+              ticket_id = str(uuid.uuid4())
+              item = {
+                  "ticketId": ticket_id,
+                  "description": description,
+                  "stepsToReproduce": steps,
+                  "environment": environment,
+                  "status": "OPEN",
+                  "createdAt": datetime.now(timezone.utc).isoformat(),
+              }
+
+              table.put_item(Item=item)
+
+              # Whatever this returns is handed back to the model as the
+              # tool result.
+              return {"ticketId": ticket_id, "status": "OPEN"}
+
+  # The AgentCore Gateway assumes this role to invoke the Lambda function.
+  # (With Bedrock Agents Classic this used to be a resource-based Lambda
+  # permission for bedrock.amazonaws.com — the gateway model uses an IAM
+  # role instead.)
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-gateway-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeBugReportLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CreateBugReportFunction.Arn
+
+  # The AgentCore managed harness assumes this role while running your
+  # chatbot: calling the Bedrock model, writing logs/metrics/traces, and
+  # invoking the gateway to reach your tool.
+  HarnessExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-harness-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HarnessExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeBedrockModels
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub arn:aws:bedrock:us-east-1:${AWS::AccountId}:*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Sid: ContainerAndTokenAuth
+                Effect: Allow
+                Action:
+                  - ecr-public:GetAuthorizationToken
+                  - sts:GetServiceBearerToken
+                Resource: '*'
+              - Sid: Tracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Sid: RuntimeLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
+                  - !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
+              - Sid: LogsResourcePolicy
+                Effect: Allow
+                Action: logs:PutResourcePolicy
+                Resource: '*'
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action: bedrock-agentcore:GetWorkloadAccessToken*
+                Resource:
+                  - !Sub arn:aws:bedrock-agentcore:us-east-1:${AWS::AccountId}:workload-identity-directory/default
+                  - !Sub arn:aws:bedrock-agentcore:us-east-1:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*
+              - Sid: Memory
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                Resource: !Sub arn:aws:bedrock-agentcore:us-east-1:${AWS::AccountId}:memory/*
+              - Sid: CodeInterpreter
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:InvokeCodeInterpreter
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                  - bedrock-agentcore:GetCodeInterpreterSession
+                  - bedrock-agentcore:ListCodeInterpreterSessions
+                Resource: arn:aws:bedrock-agentcore:us-east-1:aws:code-interpreter/*
+              # Without InvokeGateway the harness cannot load your tools —
+              # the gateway MCP endpoint returns 403 Forbidden.
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub arn:aws:bedrock-agentcore:us-east-1:${AWS::AccountId}:gateway/*
+              - Sid: Marketplace
+                Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+
+Outputs:
+  BugReportsTableName:
+    Description: Name of the BugReports DynamoDB table (use it to verify tickets)
+    Value: !Ref BugReportsTable
+
+  BugReportsTableArn:
+    Description: ARN of the BugReports DynamoDB table
+    Value: !GetAtt BugReportsTable.Arn
+
+  LambdaFunctionArn:
+    Description: ARN of the create-bug-report Lambda function
+    Value: !GetAtt CreateBugReportFunction.Arn
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution IAM role
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  GatewayRoleArn:
+    Description: ARN of the IAM role the AgentCore Gateway uses to invoke the Lambda
+    Value: !GetAtt GatewayRole.Arn
+
+  HarnessExecutionRoleArn:
+    Description: ARN of the IAM role the AgentCore managed harness runs with
+    Value: !GetAtt HarnessExecutionRole.Arn

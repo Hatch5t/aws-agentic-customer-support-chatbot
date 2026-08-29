@@ -1,0 +1,9 @@
+{
+  "tests": [
+    {
+      "id": "<unique-test-id>",
+      "prompt": "<customer-message>",
+      "expected": "<description-of-expected-response>"
+    }
+  ]
+}
